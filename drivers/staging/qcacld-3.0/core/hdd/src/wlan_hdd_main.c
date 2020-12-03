@@ -106,6 +106,10 @@
 #include "wlan_hdd_spectralscan.h"
 #include "sme_power_save_api.h"
 #include "wlan_hdd_sysfs.h"
+
+#include <linux/file.h>
+#include <linux/string.h>
+
 #ifdef WLAN_FEATURE_APF
 #include "wlan_hdd_apf.h"
 #endif
@@ -10273,6 +10277,87 @@ static int hdd_update_mac_addr_to_fw(hdd_context_t *hdd_ctx)
 	return 0;
 }
 
+static void parse_conf(const char *key, char **value)
+{
+	const char *conf_file = "/system/etc/andd.conf";
+	const int conf_size = 1024;  // max conf file content size
+	const int mac_len = 17;
+	struct file *wconf = NULL;
+	char* conf_wireless_mac = NULL;
+	char *buf = NULL, *start = NULL, *end = NULL;
+	loff_t pos = 0;
+	int ret;
+	mm_segment_t fs;
+
+	wconf = filp_open(conf_file, O_RDONLY, 0);
+	if (IS_ERR(wconf)) {
+		printk("wlan: fail to open andd conf file\n");
+		goto err1;
+	} else {
+		buf = (char*)kmalloc(conf_size * sizeof(char), GFP_KERNEL);
+		if(!buf) {
+			printk("wlan: fail to malloc buf\n");
+			filp_close(wconf, NULL);
+			goto err1;
+		}
+
+		buf = memset(buf, '\0', conf_size * sizeof(char));
+
+		fs = get_fs();
+		set_fs(KERNEL_DS);
+
+		ret = vfs_read(wconf, buf, conf_size-1, &pos);
+		if(ret < 0) {
+			printk("wlan: fail to read from conf file\n");
+			filp_close(wconf, NULL);
+			goto err2;
+		}
+
+		set_fs(fs);
+		filp_close(wconf, NULL);
+
+		conf_wireless_mac = strstr(buf, key);
+		if(!conf_wireless_mac) {
+			printk("wlan: fail to find mac in conf file\n");
+			goto err2;
+		} else {
+			// "xxx=yyy\n"
+			start = conf_wireless_mac + strlen(key) + 1;
+			end = start;
+			while('\0' != *end) {
+				if('\n' == *end) {
+					*end = '\0';
+					break;
+				}
+				end++;
+			}
+
+			// like 4c:49:e3:fa:16:98
+			if (end - start > mac_len) {
+				printk("wlan: fail to parse mac from conf file\n");
+				goto err2;
+			}
+
+			*value = (char*)kmalloc((mac_len + 1) * sizeof(char), GFP_KERNEL);
+			if(!*value) {
+				printk("wlan: fail to malloc value\n");
+				goto err2;
+			}
+			*value = memset(*value, '\0', (mac_len + 1) * sizeof(char));
+			memcpy(*value, start, mac_len);
+		}
+
+		kfree(buf);
+		return;
+	}
+
+err2:
+	kfree(buf);
+err1:
+	*value = NULL;
+	return;
+}
+
 /**
  * hdd_initialize_mac_address() - API to get wlan mac addresses
  * @hdd_ctx: HDD Context
@@ -10288,6 +10373,8 @@ static int hdd_initialize_mac_address(hdd_context_t *hdd_ctx)
 	QDF_STATUS status;
 	int ret;
 	bool update_mac_addr_to_fw = true;
+	char * conf_mac_addr = NULL;
+	uint8_t mac_bytes[6];
 
 	ret = hdd_platform_wlan_mac(hdd_ctx);
 	if (hdd_ctx->config->mac_provision || !ret) {
@@ -10309,6 +10396,27 @@ static int hdd_initialize_mac_address(hdd_context_t *hdd_ctx)
 
 	/* Use fw provided MAC */
 	if (!qdf_is_macaddr_zero(&hdd_ctx->hw_macaddr)) {
+		// try to read mac from conf file first
+		parse_conf("wireless_mac", &conf_mac_addr);
+		if(NULL != conf_mac_addr) {
+			ret = sscanf(conf_mac_addr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",  &mac_bytes[0],
+			              &mac_bytes[1], &mac_bytes[2], &mac_bytes[3], &mac_bytes[4], &mac_bytes[5]);
+			if(6 == ret) {
+				hdd_ctx->hw_macaddr.bytes[0] =  mac_bytes[0];
+				hdd_ctx->hw_macaddr.bytes[1] =  mac_bytes[1];
+				hdd_ctx->hw_macaddr.bytes[2] =  mac_bytes[2];
+				hdd_ctx->hw_macaddr.bytes[3] =  mac_bytes[3];
+				hdd_ctx->hw_macaddr.bytes[4] =  mac_bytes[4];
+				hdd_ctx->hw_macaddr.bytes[5] =  mac_bytes[5];
+			} else {
+				printk("wlan: fail to scanf mac\n");
+			}
+
+			kfree(conf_mac_addr);
+		}  else {
+			printk("wlan: fail to parse mac from conf\n");
+		}
+
 		hdd_update_macaddr(hdd_ctx, hdd_ctx->hw_macaddr, false);
 		update_mac_addr_to_fw = false;
 	} else if (hdd_generate_macaddr_auto(hdd_ctx) != 0) {
