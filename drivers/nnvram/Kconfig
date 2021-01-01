@@ -1,0 +1,5 @@
+config NNVRAM
+	tristate "nvram driver"
+	default n
+	help
+	nvram driver for Linux.
